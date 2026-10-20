@@ -18,6 +18,7 @@ import {
 } from './types/index.ts';
 import { storageService, DEFAULT_SETTINGS } from './services/storageService.ts';
 import { useAppUpdate } from './hooks/useAppUpdate.ts';
+import { geminiClientService } from './services/geminiClientService.ts';
 
 export default function App() {
   // Navigation
@@ -81,26 +82,12 @@ export default function App() {
 
     try {
       setEvalError(null);
-      const response = await fetch('/api/evaluate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
-          level: settings.level,
-          topic: topicLabel,
-          durationMinutes,
-        }),
+      const evalData = await geminiClientService.evaluate({
+        messages,
+        level: settings.level,
+        topic: topicLabel,
+        durationMinutes,
       });
-
-      if (!response.ok) {
-        const errorJson = await response.json().catch(() => null);
-        throw new Error(errorJson?.error || `Evaluation API Fehler ${response.status}`);
-      }
-
-      const evalData = await response.json();
-      if (evalData.error) {
-        throw new Error(evalData.error);
-      }
 
       const newReport: SessionReport = {
         id: `session-${Date.now()}`,
@@ -115,8 +102,22 @@ export default function App() {
         feedbackSummary:
           evalData.feedbackSummary ||
           'Tolle Fahrt! Du hast dich flüssig und selbstbewusst auf Englisch unterhalten.',
-        corrections: evalData.corrections || [],
-        vocabularyHarvest: evalData.vocabularyHarvest || [],
+        corrections: (evalData.corrections || []).map((c, i) => ({
+          id: `corr-${Date.now()}-${i}`,
+          userSaid: c.userSaid,
+          betterWay: c.betterWay,
+          explanationDe: c.explanationDe,
+          date: new Date().toISOString(),
+        })),
+        vocabularyHarvest: (evalData.vocabularyHarvest || []).map((v, i) => ({
+          id: `vocab-${Date.now()}-${i}`,
+          english: v.english,
+          german: v.german,
+          exampleSentence: v.exampleSentence,
+          cefrLevel: (v.cefrLevel || 'B1') as any,
+          savedAt: new Date().toISOString(),
+          mastered: false,
+        })),
         messagesCount: messages.length,
       };
 

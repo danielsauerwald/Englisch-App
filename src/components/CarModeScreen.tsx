@@ -20,6 +20,7 @@ import {
 } from '../types/index.ts';
 import { speechService, VoiceCommandType } from '../services/speechService.ts';
 import { wakeLockService } from '../services/wakeLockService.ts';
+import { geminiClientService } from '../services/geminiClientService.ts';
 
 interface CarModeScreenProps {
   settings: UserSettings;
@@ -172,34 +173,17 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
       const minutesLeft = Math.ceil(secondsRemaining / 60);
 
       try {
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: currentHistory.map((m) => ({ role: m.role, content: m.content })),
-            level: settings.level,
-            topicMode: overrideTopicMode || settings.topicMode,
-            customTopic: settings.customTopic,
-            correctionMode: settings.correctionMode,
-            translationMode: settings.translationMode,
-            timeRemainingMinutes: minutesLeft,
-            currentSpeed: currentSpeedRef.current,
-            isInitial: isInitialGreeting,
-          }),
+        const data = await geminiClientService.chat({
+          messages: currentHistory,
+          level: settings.level,
+          topicMode: (overrideTopicMode as any) || settings.topicMode,
+          customTopic: settings.customTopic,
+          correctionMode: settings.correctionMode,
+          translationMode: settings.translationMode,
+          timeRemainingMinutes: minutesLeft,
+          currentSpeed: currentSpeedRef.current,
+          isInitial: isInitialGreeting,
         });
-
-        if (!response.ok) {
-          const errorPayload = await response.json().catch(() => null);
-          const errorMsg =
-            errorPayload?.error ||
-            `Server-Fehler ${response.status}: ${response.statusText || 'Verbindung fehlgeschlagen'}`;
-          throw new Error(errorMsg);
-        }
-
-        const data = await response.json();
-        if (data.error) {
-          throw new Error(data.error);
-        }
 
         const assistantText = data.englishText;
         if (!assistantText) {
