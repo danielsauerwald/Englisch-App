@@ -4,7 +4,6 @@ import {
   TopicMode,
   CorrectionMode,
   TranslationMode,
-  SessionReport,
 } from '../types/index.ts';
 
 export interface ChatResponse {
@@ -35,8 +34,19 @@ export interface EvaluationResponse {
   }>;
 }
 
+/**
+ * Ordered list of candidate models.
+ * Automatically tries next model on overload or deprecation.
+ */
+const CANDIDATE_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-3.8-flash',
+  'gemini-flash-latest',
+];
+
 function getApiKey(): string {
-  // Check import.meta.env.VITE_GEMINI_API_KEY as requested
   const key =
     (import.meta as any).env?.VITE_GEMINI_API_KEY ||
     (import.meta as any).env?.GEMINI_API_KEY ||
@@ -50,58 +60,123 @@ function getApiKey(): string {
 }
 
 /**
- * Direct fetch call to official Google Gemini API v1beta endpoint
- * Primary Model: gemini-2.5-flash
- * Automatic graceful fallback to gemini-3.8-flash if Google API returns 404 (model deprecated)
+ * Check if the error indicates temporary capacity constraints / rate limits
+ */
+function isOverloadError(status: number, message: string): boolean {
+  if (status === 429 || status === 503 || status === 533 || status === 504) {
+    return true;
+  }
+  const lower = (message || '').toLowerCase();
+  return (
+    lower.includes('high demand') ||
+    lower.includes('spikes in demand') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('unavailable') ||
+    lower.includes('overload') ||
+    lower.includes('rate limit') ||
+    lower.includes('try again later') ||
+    lower.includes('503') ||
+    lower.includes('533') ||
+    lower.includes('429')
+  );
+}
+
+/**
+ * Robust Google Gemini REST caller with automatic model fallback and 2-second overload retry
  */
 async function callGeminiRestApi(
   bodyPayload: any,
-  preferredModel = 'gemini-2.5-flash'
-): Promise<any> {
+  onStatusUpdate?: (statusText: string) => void
+): Promise<string> {
   const apiKey = getApiKey();
-  const primaryUrl = `https://generativelanguage.googleapis.com/v1beta/models/${preferredModel}:generateContent?key=${encodeURIComponent(
-    apiKey
-  )}`;
+  let lastError: Error | null = null;
+  const maxPasses = 2;
 
-  let res = await fetch(primaryUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(bodyPayload),
-  });
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    for (let i = 0; i < CANDIDATE_MODELS.length; i++) {
+      const model = CANDIDATE_MODELS[i];
+      const nextModel = CANDIDATE_MODELS[i + 1] || CANDIDATE_MODELS[0];
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
+        apiKey
+      )}`;
 
-  // If Google API returns 404 (e.g. model no longer available to new users), fallback to gemini-3.8-flash
-  if (res.status === 404) {
-    const errorJson = await res.json().catch(() => null);
-    console.warn(`Model ${preferredModel} returned 404, falling back to gemini-3.8-flash:`, errorJson);
-    const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(
-      apiKey
-    )}`;
-    res = await fetch(fallbackUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(bodyPayload),
-    });
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(bodyPayload),
+        });
+
+        if (res.ok) {
+          const json = await res.json();
+          const candidateText = json.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!candidateText) {
+            throw new Error(`Modell ${model} hat eine leere Antwort geliefert.`);
+          }
+          return candidateText;
+        }
+
+        const errData = await res.json().catch(() => null);
+        const serverMessage =
+          errData?.error?.message ||
+          `Gemini API Fehler ${res.status}: ${res.statusText || 'Verbindung fehlgeschlagen'}`;
+
+        // 404: Model not available/deprecated for this account -> Switch immediately to next model
+        if (res.status === 404) {
+          console.warn(`Modell ${model} nicht verfügbar (404), wechsle zu ${nextModel}...`);
+          lastError = new Error(serverMessage);
+          continue;
+        }
+
+        // Overload error (429, 503, 533, High Demand, etc.) -> Wait 2 seconds and switch model
+        if (isOverloadError(res.status, serverMessage)) {
+          const notice = `Modell ${model} ausgelastet (${res.status}). Wechsle zu ${nextModel} (Retry in 2s)...`;
+          console.warn(notice);
+          onStatusUpdate?.(notice);
+          lastError = new Error(`Modell ${model} ausgelastet: ${serverMessage}`);
+
+          // Automatic 2-second retry wait
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          continue;
+        }
+
+        // If it's another non-overload error (e.g. 400 Invalid Argument or 403 Key Invalid), rethrow immediately
+        if (res.status === 400 || res.status === 401 || res.status === 403) {
+          throw new Error(serverMessage);
+        }
+
+        lastError = new Error(serverMessage);
+      } catch (err: any) {
+        lastError = err;
+        const msg = err?.message || String(err);
+
+        // If API key is wrong, don't waste time retrying
+        if (msg.includes('API_KEY_INVALID') || msg.includes('API key not valid')) {
+          throw err;
+        }
+
+        if (isOverloadError(0, msg)) {
+          const notice = `Netzwerk/Auslastung bei ${model}. Wechsle zu ${nextModel} (Retry in 2s)...`;
+          console.warn(notice);
+          onStatusUpdate?.(notice);
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          continue;
+        }
+
+        // Proceed to next fallback model
+        continue;
+      }
+    }
   }
 
-  if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    const serverMessage =
-      errData?.error?.message ||
-      `Gemini API Fehler ${res.status}: ${res.statusText || 'Verbindung fehlgeschlagen'}`;
-    throw new Error(serverMessage);
-  }
-
-  const json = await res.json();
-  const candidateText = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!candidateText) {
-    throw new Error('Die Gemini API hat keine Text-Antwort zurückgegeben.');
-  }
-
-  return candidateText;
+  throw (
+    lastError ||
+    new Error(
+      'Alle Gemini-Modelle sind momentan ausgelastet. Bitte versuche es in wenigen Augenblicken erneut.'
+    )
+  );
 }
 
 export const geminiClientService = {
@@ -115,6 +190,7 @@ export const geminiClientService = {
     timeRemainingMinutes?: number;
     currentSpeed?: number;
     isInitial?: boolean;
+    onStatusUpdate?: (status: string) => void;
   }): Promise<ChatResponse> {
     const {
       messages,
@@ -125,11 +201,13 @@ export const geminiClientService = {
       translationMode,
       timeRemainingMinutes,
       isInitial,
+      onStatusUpdate,
     } = params;
 
     const topicDescriptions: Record<string, string> = {
-      random: 'An intriguing, engaging general topic (e.g. travel memories, fascinating innovations, food culture, or hobbies).',
-      news: 'Today\'s top breaking world news, technology breakthroughs, or global events. Keep facts accurate.',
+      random:
+        'An intriguing, engaging general topic (e.g. travel memories, fascinating innovations, food culture, or hobbies).',
+      news: "Today's top breaking world news, technology breakthroughs, or global events. Keep facts accurate.",
       business: 'Business, global economics, financial markets, start-ups, and career leadership.',
       society: 'Modern society, cultural trends, daily habits, lifestyle, and work-life balance.',
       custom: `User requested custom topic: "${customTopic || 'English conversation practice'}"`,
@@ -145,18 +223,23 @@ export const geminiClientService = {
 
     let correctionInstruction = '';
     if (correctionMode === 'free') {
-      correctionInstruction = 'Do NOT correct mistakes during the conversation. Keep the flow smooth and friendly.';
+      correctionInstruction =
+        'Do NOT correct mistakes during the conversation. Keep the flow smooth and friendly.';
     } else if (correctionMode === 'gentle') {
-      correctionInstruction = 'GENTLE RECAST: If the user made a grammar error, naturally mirror the correct form in your reply without calling it out as wrong.';
+      correctionInstruction =
+        'GENTLE RECAST: If the user made a grammar error, naturally mirror the correct form in your reply without calling it out as wrong.';
     } else {
-      correctionInstruction = 'STRICT TEACHER: If the user made an error, include a brief polite 1-sentence tip before continuing.';
+      correctionInstruction =
+        'STRICT TEACHER: If the user made an error, include a brief polite 1-sentence tip before continuing.';
     }
 
     let translationInstruction = '';
     if (translationMode === 'with_translation') {
-      translationInstruction = 'Always provide both the English spoken response and a natural German translation.';
+      translationInstruction =
+        'Always provide both the English spoken response and a natural German translation.';
     } else if (translationMode === 'on_demand') {
-      translationInstruction = 'Only provide German if the user specifically asked for translation or clarification.';
+      translationInstruction =
+        'Only provide German if the user specifically asked for translation or clarification.';
     } else {
       translationInstruction = '100% English conversation only.';
     }
@@ -245,7 +328,7 @@ You must respond in valid JSON format matching this schema:
       },
     };
 
-    const rawJson = await callGeminiRestApi(requestBody, 'gemini-2.5-flash');
+    const rawJson = await callGeminiRestApi(requestBody, onStatusUpdate);
     try {
       const parsed = JSON.parse(rawJson);
       return {
@@ -268,8 +351,9 @@ You must respond in valid JSON format matching this schema:
     level: string;
     topic: string;
     durationMinutes: number;
+    onStatusUpdate?: (status: string) => void;
   }): Promise<EvaluationResponse> {
-    const { messages, level, topic, durationMinutes } = params;
+    const { messages, level, topic, durationMinutes, onStatusUpdate } = params;
 
     const transcript = messages
       .map((m) => `${m.role === 'user' ? 'Learner' : 'Coach'}: ${m.content}`)
@@ -314,7 +398,9 @@ Respond strictly in valid JSON matching this structure:
           role: 'user',
           parts: [
             {
-              text: `Here is the conversation transcript to analyze:\n\n${transcript || 'Learner had a brief greeting conversation.'}`,
+              text: `Here is the conversation transcript to analyze:\n\n${
+                transcript || 'Learner had a brief greeting conversation.'
+              }`,
             },
           ],
         },
@@ -325,7 +411,7 @@ Respond strictly in valid JSON matching this structure:
       },
     };
 
-    const rawJson = await callGeminiRestApi(requestBody, 'gemini-2.5-flash');
+    const rawJson = await callGeminiRestApi(requestBody, onStatusUpdate);
     return JSON.parse(rawJson) as EvaluationResponse;
   },
 };

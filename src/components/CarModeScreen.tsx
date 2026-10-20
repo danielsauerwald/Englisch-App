@@ -183,6 +183,7 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
           timeRemainingMinutes: minutesLeft,
           currentSpeed: currentSpeedRef.current,
           isInitial: isInitialGreeting,
+          onStatusUpdate: (msg: string) => setStatusMessage(msg),
         });
 
         const assistantText = data.englishText;
