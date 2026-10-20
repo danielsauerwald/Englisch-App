@@ -171,11 +171,22 @@ async function callGeminiRestApi(
     }
   }
 
-  throw (
-    lastError ||
-    new Error(
-      'Alle Gemini-Modelle sind momentan ausgelastet. Bitte versuche es in wenigen Augenblicken erneut.'
-    )
+  if (lastError) {
+    const errorMsg = lastError.message || String(lastError);
+    if (
+      errorMsg.toLowerCase().includes('quota') ||
+      errorMsg.toLowerCase().includes('resource_exhausted') ||
+      errorMsg.includes('429')
+    ) {
+      throw new Error(
+        'API-Quota vorübergehend erschöpft (Quota Exceeded / Rate Limit). Das Kontingent deines Gemini API-Keys ist momentan limitiert. Bitte warte 30 Sekunden und versuche es erneut, oder wechsle zu einem Key mit höherem Kontingent.'
+      );
+    }
+    throw lastError;
+  }
+
+  throw new Error(
+    'Alle Gemini-Modelle sind momentan ausgelastet. Bitte versuche es in wenigen Augenblicken erneut.'
   );
 }
 

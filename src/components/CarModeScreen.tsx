@@ -43,6 +43,13 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   const [lastUserSpeech, setLastUserSpeech] = useState('');
   const [apiError, setApiError] = useState<string | null>(null);
 
+  // 3.5s Denkpause (Extended thinking buffer before sending to Gemini)
+  const [silenceCountdown, setSilenceCountdown] = useState<number | null>(null);
+  const [bufferedUserSpeech, setBufferedUserSpeech] = useState<string>('');
+  const speechBufferRef = useRef<string>('');
+  const silenceTimerRef = useRef<any>(null);
+  const countdownIntervalRef = useRef<any>(null);
+
   const [lastAiResponse, setLastAiResponse] = useState<{
     english: string;
     german?: string;
@@ -274,34 +281,124 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
     [lastAiResponse, sendToGemini, settings.voiceURI, speakAiText]
   );
 
-  // Final Speech Transcript handler
-  const handleFinalSpeech = useCallback(
-    (transcript: string) => {
-      if (!transcript || transcript.trim().length === 0) return;
-      setLastUserSpeech(transcript);
+  // Clear silence debounce timer
+  const clearSilenceDebounce = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setSilenceCountdown(null);
+  }, []);
+
+  // Barge-In handler: stop speech synthesis immediately and start listening
+  const triggerBargeIn = useCallback(() => {
+    if (speechService.isSpeakingAudio() || isAiSpeaking) {
+      console.log('Triggering Barge-In...');
+      speechService.cancelSpeech();
+      setIsAiSpeaking(false);
+      setStatusMessage('Unterbrochen – Höre dir zu...');
+      speechService.startListening(true);
+    }
+  }, [isAiSpeaking]);
+
+  // Commit buffered speech after 3.5s silence or manual button press
+  const commitBufferedSpeech = useCallback(() => {
+    clearSilenceDebounce();
+    const textToSend = speechBufferRef.current.trim();
+    speechBufferRef.current = '';
+    setBufferedUserSpeech('');
+    setInterimTranscript('');
+    setSilenceCountdown(null);
+
+    if (!textToSend) return;
+
+    // Check voice commands first
+    const detected = speechService.detectVoiceCommand(textToSend);
+    if (detected) {
+      handleVoiceCommand(detected.command);
+      return;
+    }
+
+    // Normal conversation turn: forward real accumulated text to Gemini
+    sendToGemini(textToSend);
+  }, [clearSilenceDebounce, handleVoiceCommand, sendToGemini]);
+
+  // Handle Interim Speech
+  const handleInterimSpeech = useCallback(
+    (text: string) => {
+      // If AI is speaking, user speech triggers immediate Barge-in
+      if (isAiSpeaking || speechService.isSpeakingAudio()) {
+        triggerBargeIn();
+      }
+      setInterimTranscript(text);
+      // While user continues to speak interim words, pause/reset the silence countdown
+      clearSilenceDebounce();
+    },
+    [clearSilenceDebounce, isAiSpeaking, triggerBargeIn]
+  );
+
+  // Handle Final Speech Chunk (accumulate into buffer + start 3.5s Denkpause timer)
+  const handleFinalSpeechChunk = useCallback(
+    (chunk: string) => {
+      if (isAiSpeaking || speechService.isSpeakingAudio()) {
+        triggerBargeIn();
+      }
+
+      if (!chunk || chunk.trim().length === 0) return;
+
+      const newFull = (speechBufferRef.current + ' ' + chunk).trim();
+      speechBufferRef.current = newFull;
+      setBufferedUserSpeech(newFull);
+      setLastUserSpeech(newFull);
       setInterimTranscript('');
 
-      // Check for voice commands first
-      const detected = speechService.detectVoiceCommand(transcript);
+      // Check if it's an immediate voice command like "langsamer", "wiederholen", "stop training"
+      const detected = speechService.detectVoiceCommand(newFull);
       if (detected) {
+        clearSilenceDebounce();
+        speechBufferRef.current = '';
+        setBufferedUserSpeech('');
         handleVoiceCommand(detected.command);
         return;
       }
 
-      // Normal conversation turn: forward real input to Gemini with chat history
-      sendToGemini(transcript);
+      // Start 3.5s silence timer (Denkpause - gives driver ample time to think before sending)
+      clearSilenceDebounce();
+      let timeLeft = 3.5;
+      setSilenceCountdown(Math.ceil(timeLeft));
+      setStatusMessage(`Denkpause: Sende in ${Math.ceil(timeLeft)}s...`);
+
+      countdownIntervalRef.current = setInterval(() => {
+        timeLeft -= 0.5;
+        if (timeLeft <= 0) {
+          if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+        } else {
+          setSilenceCountdown(Math.ceil(timeLeft));
+          setStatusMessage(`Denkpause: Sende in ${Math.ceil(timeLeft)}s...`);
+        }
+      }, 500);
+
+      silenceTimerRef.current = setTimeout(() => {
+        commitBufferedSpeech();
+      }, 3500);
     },
-    [handleVoiceCommand, sendToGemini]
+    [clearSilenceDebounce, commitBufferedSpeech, handleVoiceCommand, isAiSpeaking, triggerBargeIn]
   );
 
   // Initialize Speech Recognition on Mount
   useEffect(() => {
     speechService.initRecognition({
-      onInterim: (text) => setInterimTranscript(text),
-      onFinal: (text) => handleFinalSpeech(text),
+      onInterim: (text) => handleInterimSpeech(text),
+      onFinal: (chunk) => handleFinalSpeechChunk(chunk),
+      onBargeIn: () => triggerBargeIn(),
       onStateChange: (listening) => {
         setIsListening(listening);
-        if (listening) {
+        if (listening && !isAiSpeaking && silenceCountdown === null) {
           setStatusMessage('Höre zu (Du kannst sprechen)...');
         }
       },
@@ -317,11 +414,13 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
 
     return () => {
       clearTimeout(timer);
+      clearSilenceDebounce();
     };
   }, []);
 
   // Wrap up & finish
   const handleWrapUpAndFinish = () => {
+    clearSilenceDebounce();
     speechService.cancelSpeech();
     speechService.abortListening();
     speechService.setAutoListen(false);
@@ -332,8 +431,18 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
     onFinishSession(messagesRef.current, elapsedMinutes);
   };
 
-  // Toggle Pause Mic
+  // Toggle Pause Mic or Barge-In / Send immediately
   const handleTogglePause = () => {
+    if (isAiSpeaking || speechService.isSpeakingAudio()) {
+      triggerBargeIn();
+      return;
+    }
+
+    if (silenceCountdown !== null || speechBufferRef.current.trim().length > 0) {
+      commitBufferedSpeech();
+      return;
+    }
+
     if (isUserPaused) {
       setIsUserPaused(false);
       speechService.setAutoListen(true);
@@ -341,6 +450,7 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
       speechService.startListening();
     } else {
       setIsUserPaused(true);
+      clearSilenceDebounce();
       speechService.setAutoListen(false);
       setStatusMessage('Mikrofon pausiert');
       speechService.cancelSpeech();
@@ -433,15 +543,26 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
             </>
           )}
 
-          {/* Central status orb */}
-          <div
-            className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-2xl transition duration-500 border-4 ${
+          {/* Central status orb / Touch to Barge-In or Send */}
+          <button
+            onClick={() => {
+              if (isAiSpeaking || speechService.isSpeakingAudio()) {
+                triggerBargeIn();
+              } else if (silenceCountdown !== null || speechBufferRef.current.trim().length > 0) {
+                commitBufferedSpeech();
+              } else {
+                handleTogglePause();
+              }
+            }}
+            className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-2xl transition duration-500 border-4 cursor-pointer active:scale-95 ${
               apiError
                 ? 'bg-rose-950/80 border-rose-500 text-rose-300 shadow-rose-500/40'
-                : isUserPaused
-                ? 'bg-slate-900 border-amber-500/50 text-amber-400 shadow-amber-500/20'
                 : isAiSpeaking
                 ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 border-purple-300 text-white shadow-purple-500/40 scale-105'
+                : silenceCountdown !== null
+                ? 'bg-gradient-to-tr from-cyan-400 to-blue-600 border-cyan-200 text-slate-950 shadow-cyan-400/50 scale-105 animate-pulse'
+                : isUserPaused
+                ? 'bg-slate-900 border-amber-500/50 text-amber-400 shadow-amber-500/20'
                 : isAiThinking
                 ? 'bg-slate-900 border-amber-400 text-amber-400 animate-pulse shadow-amber-500/30'
                 : isListening
@@ -454,15 +575,20 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
                 <AlertTriangle className="w-10 h-10" />
                 <span className="text-[10px] font-black uppercase tracking-wider mt-1">Fehler</span>
               </>
+            ) : isAiSpeaking ? (
+              <>
+                <Volume2 className="w-10 h-10 animate-pulse" />
+                <span className="text-[10px] font-black uppercase tracking-wider mt-1">Unterbrechen</span>
+              </>
+            ) : silenceCountdown !== null ? (
+              <>
+                <Sparkles className="w-10 h-10 animate-bounce" />
+                <span className="text-[10px] font-black uppercase tracking-wider mt-1">Sende in {silenceCountdown}s</span>
+              </>
             ) : isUserPaused ? (
               <>
                 <MicOff className="w-10 h-10" />
                 <span className="text-[10px] font-black uppercase tracking-wider mt-1">Pausiert</span>
-              </>
-            ) : isAiSpeaking ? (
-              <>
-                <Volume2 className="w-10 h-10 animate-pulse" />
-                <span className="text-[10px] font-black uppercase tracking-wider mt-1">KI spricht</span>
               </>
             ) : isAiThinking ? (
               <>
@@ -480,19 +606,21 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
                 <span className="text-[10px] font-black uppercase tracking-wider mt-1">Bereit</span>
               </>
             )}
-          </div>
+          </button>
         </div>
 
         {/* Spoken Status Text */}
-        <div className="mb-4">
+        <div className="mb-3">
           <span
             className={`inline-block text-xs uppercase font-extrabold tracking-widest px-3 py-1 rounded-full ${
               apiError
                 ? 'bg-rose-500/20 text-rose-300 border border-rose-500/50'
-                : isUserPaused
-                ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
                 : isAiSpeaking
                 ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                : silenceCountdown !== null
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : isUserPaused
+                ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
                 : isAiThinking
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                 : isListening
@@ -504,13 +632,38 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
           </span>
         </div>
 
+        {/* Denkpause Bar: Appears when speech is paused, counting down 3.5s */}
+        {silenceCountdown !== null && !isAiSpeaking && !apiError && (
+          <div className="w-full mb-3 bg-cyan-950/90 border-2 border-cyan-400/80 rounded-2xl p-3 flex items-center justify-between shadow-xl animate-pulse">
+            <div className="flex items-center gap-2.5 text-left">
+              <Clock className="w-5 h-5 text-cyan-400 shrink-0" />
+              <div>
+                <div className="text-xs font-black uppercase text-cyan-300">
+                  Denkpause aktiv: Sende in {silenceCountdown}s...
+                </div>
+                <div className="text-[11px] text-slate-300">
+                  Sprich in Ruhe weiter – oder tippe auf "Jetzt senden"
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={commitBufferedSpeech}
+              className="py-2 px-3.5 rounded-xl bg-cyan-400 text-slate-950 font-black text-xs hover:bg-cyan-300 active:scale-95 transition shrink-0 ml-2 shadow cursor-pointer"
+            >
+              Jetzt senden
+            </button>
+          </div>
+        )}
+
         {/* RED ERROR BOX (When an API error occurs, show exact technical error) */}
         {apiError ? (
           <div className="w-full bg-rose-950/80 border-2 border-rose-500 rounded-3xl p-5 sm:p-6 shadow-2xl backdrop-blur-md text-left space-y-3 animate-shake">
             <div className="flex items-center gap-2.5 text-rose-400">
               <AlertTriangle className="w-6 h-6 shrink-0" />
               <h3 className="font-extrabold text-base sm:text-lg text-white">
-                Gemini API-Fehler aufgetreten
+                {apiError.toLowerCase().includes('quota')
+                  ? 'Gemini API-Quota erschöpft'
+                  : 'Gemini API-Fehler'}
               </h3>
             </div>
             <p className="text-xs sm:text-sm text-rose-200 font-mono bg-black/50 p-3 rounded-xl border border-rose-900 break-words">
@@ -519,14 +672,14 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
             <div className="flex gap-2 pt-1">
               <button
                 onClick={() => sendToGemini(lastUserSpeech || undefined)}
-                className="flex-1 py-3 px-4 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition"
+                className="flex-1 py-3 px-4 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition cursor-pointer"
               >
                 <RefreshCw className="w-4 h-4" />
                 <span>Erneut versuchen</span>
               </button>
               <button
                 onClick={onExitWithoutSave}
-                className="py-3 px-4 rounded-xl bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 font-bold text-xs transition"
+                className="py-3 px-4 rounded-xl bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 font-bold text-xs transition cursor-pointer"
               >
                 Abbrechen
               </button>
@@ -548,12 +701,12 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
               </div>
             )}
 
-            {/* Live User Speech Bubble / Interim */}
-            {(interimTranscript || lastUserSpeech) && (
-              <div className="mt-4 pt-3 border-t border-slate-800/60 text-xs sm:text-sm text-slate-400 flex items-center justify-center gap-2">
+            {/* Live User Speech Bubble / Buffered Speech */}
+            {(bufferedUserSpeech || interimTranscript || lastUserSpeech) && (
+              <div className="mt-4 pt-3 border-t border-slate-800/60 text-xs sm:text-sm text-slate-300 flex items-center justify-center gap-2">
                 <span className="text-cyan-400 font-bold">Du:</span>
-                <span className="italic text-slate-200">
-                  "{interimTranscript || lastUserSpeech}"
+                <span className="italic text-slate-200 font-medium">
+                  "{bufferedUserSpeech || interimTranscript || lastUserSpeech}"
                 </span>
               </div>
             )}
@@ -583,16 +736,30 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
 
       {/* 3. BOTTOM CAR COCKPIT CONTROLS (Extra-Large thumb-friendly buttons 64px - 84px) */}
       <div className="z-20 max-w-2xl mx-auto w-full space-y-3 pb-2">
-        {/* Giant Pause / Resume Button in Center (Height 76px) */}
+        {/* Giant Contextual Cockpit Button */}
         <button
           onClick={handleTogglePause}
-          className={`w-full h-20 rounded-3xl font-black text-xl flex items-center justify-center gap-3 shadow-2xl transition active:scale-[0.98] cursor-pointer ${
-            isUserPaused
+          className={`w-full h-20 rounded-3xl font-black text-lg sm:text-xl flex items-center justify-center gap-3 shadow-2xl transition active:scale-[0.98] cursor-pointer ${
+            isAiSpeaking
+              ? 'bg-gradient-to-r from-purple-500 to-indigo-600 text-white shadow-purple-500/40 animate-pulse'
+              : silenceCountdown !== null
+              ? 'bg-gradient-to-r from-cyan-400 to-blue-500 text-slate-950 shadow-cyan-400/40 animate-bounce'
+              : isUserPaused
               ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-slate-950 shadow-emerald-500/30'
               : 'bg-gradient-to-r from-amber-500 to-orange-600 text-slate-950 shadow-amber-500/30'
           }`}
         >
-          {isUserPaused ? (
+          {isAiSpeaking ? (
+            <>
+              <Mic className="w-8 h-8" />
+              <span>KI UNTERBRECHEN (Barge-in)</span>
+            </>
+          ) : silenceCountdown !== null ? (
+            <>
+              <Sparkles className="w-8 h-8" />
+              <span>SOFORT SENDEN ({silenceCountdown}s)</span>
+            </>
+          ) : isUserPaused ? (
             <>
               <Mic className="w-8 h-8" />
               <span>Mikrofon FORTSETZEN</span>

@@ -137,11 +137,19 @@ class SpeechService {
     return null;
   }
 
+  public isSpeakingAudio(): boolean {
+    return (
+      this.isSpeaking ||
+      (typeof window !== 'undefined' && Boolean(window.speechSynthesis?.speaking))
+    );
+  }
+
   public initRecognition(callbacks: {
     onInterim: (text: string) => void;
     onFinal: (text: string) => void;
     onStateChange: (isListening: boolean) => void;
     onError: (error: string) => void;
+    onBargeIn?: () => void;
   }) {
     if (!this.isSpeechRecognitionSupported()) {
       callbacks.onError('Web SpeechRecognition wird von diesem Browser leider nicht unterstützt.');
@@ -160,7 +168,23 @@ class SpeechService {
       callbacks.onStateChange(true);
     };
 
+    // Barge-in: immediately cancel AI speech if user starts speaking
+    this.recognition.onspeechstart = () => {
+      if (this.isSpeakingAudio()) {
+        console.log('Barge-in detected via onspeechstart – cancelling TTS');
+        this.cancelSpeech();
+        callbacks.onBargeIn?.();
+      }
+    };
+
     this.recognition.onresult = (event: any) => {
+      // Barge-in on recognized text while TTS is active
+      if (this.isSpeakingAudio()) {
+        console.log('Barge-in detected via onresult – cancelling TTS');
+        this.cancelSpeech();
+        callbacks.onBargeIn?.();
+      }
+
       let interim = '';
       let final = '';
 
@@ -195,12 +219,17 @@ class SpeechService {
     this.recognition.onend = () => {
       this.isRecognitionActive = false;
       callbacks.onStateChange(false);
+      // Auto-restart if listening should stay active
+      if (!this.isIntentionalAbort && this.autoListenEnabled && !this.isSpeakingAudio()) {
+        setTimeout(() => {
+          this.startListening();
+        }, 300);
+      }
     };
   }
 
-  public startListening(): void {
-    if (this.isSpeaking) {
-      // NEVER start mic while speaker is active
+  public startListening(force = false): void {
+    if (this.isSpeaking && !force) {
       return;
     }
     if (this.recognition && !this.isRecognitionActive) {
@@ -208,7 +237,7 @@ class SpeechService {
         this.isIntentionalAbort = false;
         this.recognition.start();
       } catch (e) {
-        // Recognition might already be running or transitioning
+        // Recognition might already be running
       }
     }
   }
@@ -296,9 +325,17 @@ class SpeechService {
 
     utterance.onstart = () => {
       this.isSpeaking = true;
-      // Re-verify mic is off
-      this.abortListening();
       options.onStart?.();
+
+      // Start recognition with small delay so the user can barge-in by speaking aloud
+      if (this.restartTimeout) {
+        clearTimeout(this.restartTimeout);
+      }
+      this.restartTimeout = setTimeout(() => {
+        if (this.isSpeaking && this.autoListenEnabled) {
+          this.startListening(true);
+        }
+      }, 300);
     };
 
     utterance.onend = () => {
