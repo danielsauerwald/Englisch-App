@@ -1,0 +1,6 @@
+{
+  "name": "DriveEnglish - Hands-Free AI Car Trainer",
+  "description": "Interaktiver KI-Englisch-Sprachtrainer für die Autofahrt. Freihändige Konversationen, CEFR-Stufen, Web Speech & Gemini Grounding mit Lernstatistik.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
