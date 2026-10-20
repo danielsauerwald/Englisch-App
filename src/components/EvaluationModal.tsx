@@ -1,15 +1,16 @@
 import React, { useState } from 'react';
 import {
   Award,
-  CheckCircle2,
-  AlertCircle,
   BookmarkPlus,
   BookmarkCheck,
   Volume2,
   Car,
   BarChart3,
   Sparkles,
-  ArrowRight,
+  AlertCircle,
+  AlertTriangle,
+  RefreshCw,
+  X,
 } from 'lucide-react';
 import { SessionReport, VocabularyItem } from '../types/index.ts';
 import { storageService } from '../services/storageService.ts';
@@ -18,15 +19,21 @@ import { speechService } from '../services/speechService.ts';
 interface EvaluationModalProps {
   report: SessionReport | null;
   isLoading: boolean;
+  errorMessage?: string | null;
+  onRetry?: () => void;
   onGoToDashboard: () => void;
   onNewDrive: () => void;
+  onClose?: () => void;
 }
 
 export const EvaluationModal: React.FC<EvaluationModalProps> = ({
   report,
   isLoading,
+  errorMessage,
+  onRetry,
   onGoToDashboard,
   onNewDrive,
+  onClose,
 }) => {
   const [savedVocabIds, setSavedVocabIds] = useState<Set<string>>(new Set());
 
@@ -43,6 +50,46 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
               Die KI analysiert deinen gesamten Gesprächsverlauf, Grammatik, Wortschatz und deine
               Ausdrucksstärke.
             </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (errorMessage) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4">
+        <div className="w-full max-w-lg rounded-3xl bg-slate-900 border-2 border-rose-500 p-6 sm:p-8 shadow-2xl space-y-4">
+          <div className="flex items-center gap-3 text-rose-400">
+            <AlertTriangle className="w-8 h-8 shrink-0" />
+            <div>
+              <span className="text-xs font-bold uppercase tracking-wider text-rose-400">
+                Fehler bei der Auswertung
+              </span>
+              <h3 className="text-xl font-black text-white">Gemini API-Fehler</h3>
+            </div>
+          </div>
+
+          <p className="text-xs sm:text-sm text-rose-200 font-mono bg-black/60 p-4 rounded-xl border border-rose-900 break-words leading-relaxed">
+            {errorMessage}
+          </p>
+
+          <div className="flex flex-col sm:flex-row gap-3 pt-2">
+            {onRetry && (
+              <button
+                onClick={onRetry}
+                className="flex-1 py-3.5 px-4 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 transition"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>Auswertung wiederholen</span>
+              </button>
+            )}
+            <button
+              onClick={onNewDrive}
+              className="py-3.5 px-5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-sm transition"
+            >
+              Neue Fahrt
+            </button>
           </div>
         </div>
       </div>
@@ -120,7 +167,7 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
           <p className="text-sm text-slate-200 leading-relaxed">{report.feedbackSummary}</p>
         </div>
 
-        {/* Corrections Breakdown ("Was du gesagt hast" vs "Besser") */}
+        {/* Corrections Breakdown */}
         {report.corrections && report.corrections.length > 0 && (
           <div className="space-y-3">
             <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">

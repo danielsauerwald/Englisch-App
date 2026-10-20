@@ -25,52 +25,9 @@ class SpeechService {
   private isRecognitionActive: boolean = false;
   private isSpeaking: boolean = false;
   private currentUtterance: SpeechSynthesisUtterance | null = null;
-  private audioCtx: AudioContext | null = null;
-
-  // Sound chimes for driver auditory feedback
-  private playTone(freq: number, type: OscillatorType, duration: number, gainValue = 0.08) {
-    try {
-      if (!this.audioCtx) {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        if (AudioContextClass) {
-          this.audioCtx = new AudioContextClass();
-        }
-      }
-      if (this.audioCtx && this.audioCtx.state === 'suspended') {
-        this.audioCtx.resume();
-      }
-      if (!this.audioCtx) return;
-
-      const osc = this.audioCtx.createOscillator();
-      const gain = this.audioCtx.createGain();
-      osc.type = type;
-      osc.frequency.setValueAtTime(freq, this.audioCtx.currentTime);
-      gain.gain.setValueAtTime(gainValue, this.audioCtx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, this.audioCtx.currentTime + duration);
-
-      osc.connect(gain);
-      gain.connect(this.audioCtx.destination);
-      osc.start();
-      osc.stop(this.audioCtx.currentTime + duration);
-    } catch (e) {
-      // AudioContext might be blocked or unavailable; non-critical
-    }
-  }
-
-  public playListeningChime() {
-    this.playTone(587.33, 'sine', 0.12, 0.05); // D5
-    setTimeout(() => this.playTone(880, 'sine', 0.15, 0.06), 80); // A5
-  }
-
-  public playCommandChime() {
-    this.playTone(523.25, 'triangle', 0.1, 0.08); // C5
-    setTimeout(() => this.playTone(659.25, 'triangle', 0.1, 0.08), 70); // E5
-    setTimeout(() => this.playTone(783.99, 'triangle', 0.18, 0.08), 140); // G5
-  }
-
-  public playThinkingChime() {
-    this.playTone(440, 'sine', 0.15, 0.04);
-  }
+  private isIntentionalAbort: boolean = false;
+  private autoListenEnabled: boolean = true;
+  private restartTimeout: any = null;
 
   public isSpeechRecognitionSupported(): boolean {
     return typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -78,6 +35,10 @@ class SpeechService {
 
   public isSpeechSynthesisSupported(): boolean {
     return typeof window !== 'undefined' && 'speechSynthesis' in window;
+  }
+
+  public setAutoListen(enabled: boolean) {
+    this.autoListenEnabled = enabled;
   }
 
   public async getAvailableVoices(): Promise<SpeechSynthesisVoice[]> {
@@ -93,7 +54,6 @@ class SpeechService {
         voices = window.speechSynthesis.getVoices();
         resolve(voices);
       };
-      // Fallback timeout in case onvoiceschanged does not fire
       setTimeout(() => {
         resolve(window.speechSynthesis.getVoices());
       }, 500);
@@ -101,7 +61,14 @@ class SpeechService {
   }
 
   public getEnglishVoices(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice[] {
-    return voices.filter((v) => v.lang.startsWith('en'));
+    return voices.filter(
+      (v) =>
+        v.lang === 'en-US' ||
+        v.lang === 'en-GB' ||
+        v.lang.startsWith('en_US') ||
+        v.lang.startsWith('en_GB') ||
+        v.lang.startsWith('en')
+    );
   }
 
   public detectVoiceCommand(transcript: string): VoiceCommandDetection | null {
@@ -189,8 +156,8 @@ class SpeechService {
 
     this.recognition.onstart = () => {
       this.isRecognitionActive = true;
+      this.isIntentionalAbort = false;
       callbacks.onStateChange(true);
-      this.playListeningChime();
     };
 
     this.recognition.onresult = (event: any) => {
@@ -215,14 +182,13 @@ class SpeechService {
     };
 
     this.recognition.onerror = (event: any) => {
+      if (this.isIntentionalAbort || event.error === 'aborted') {
+        return;
+      }
       if (event.error === 'no-speech') {
-        // Normal silence timeout while driving
         return;
       }
-      if (event.error === 'aborted') {
-        return;
-      }
-      console.warn('Speech recognition error:', event.error);
+      console.warn('Speech recognition event error:', event.error);
       callbacks.onError(event.error);
     };
 
@@ -234,27 +200,42 @@ class SpeechService {
 
   public startListening(): void {
     if (this.isSpeaking) {
-      // Do not start mic while AI is talking to prevent feedback
+      // NEVER start mic while speaker is active
       return;
     }
     if (this.recognition && !this.isRecognitionActive) {
       try {
+        this.isIntentionalAbort = false;
         this.recognition.start();
       } catch (e) {
-        // Already started or restarting
+        // Recognition might already be running or transitioning
       }
     }
   }
 
-  public stopListening(): void {
+  // Strict separation: Abort mic capture immediately before audio output
+  public abortListening(): void {
+    if (this.restartTimeout) {
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
+    }
     if (this.recognition && this.isRecognitionActive) {
+      this.isIntentionalAbort = true;
       try {
-        this.recognition.stop();
+        this.recognition.abort();
       } catch (e) {
-        // Ignore
+        try {
+          this.recognition.stop();
+        } catch (stopErr) {
+          // Ignore
+        }
       }
       this.isRecognitionActive = false;
     }
+  }
+
+  public stopListening(): void {
+    this.abortListening();
   }
 
   public cancelSpeech(): void {
@@ -281,8 +262,11 @@ class SpeechService {
       return;
     }
 
-    // Stop recognition during AI speech
-    this.stopListening();
+    // 1. Zwingende Mikrofon- und Lautsprecher-Trennung:
+    // Stoppe / breche das Mikrofon SOFORT ab, BEVOR die Sprachausgabe startet
+    this.abortListening();
+
+    // 2. Vor jedem neuen Sprechen muss window.speechSynthesis.cancel() aufgerufen werden
     this.cancelSpeech();
 
     const utterance = new SpeechSynthesisUtterance(text);
@@ -300,9 +284,10 @@ class SpeechService {
         utterance.voice = selected;
       }
     } else {
-      // Prefer clean English voice
+      // Pick clean installed native English voices (en-US or en-GB)
       const enVoice =
-        voices.find((v) => v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Samantha') || v.name.includes('Daniel'))) ||
+        voices.find((v) => (v.lang === 'en-US' || v.lang === 'en-GB') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Samantha') || v.name.includes('Daniel') || v.name.includes('Siri'))) ||
+        voices.find((v) => v.lang === 'en-US' || v.lang === 'en-GB') ||
         voices.find((v) => v.lang.startsWith('en'));
       if (enVoice) {
         utterance.voice = enVoice;
@@ -311,6 +296,8 @@ class SpeechService {
 
     utterance.onstart = () => {
       this.isSpeaking = true;
+      // Re-verify mic is off
+      this.abortListening();
       options.onStart?.();
     };
 
@@ -318,8 +305,16 @@ class SpeechService {
       this.isSpeaking = false;
       this.currentUtterance = null;
       options.onEnd?.();
-      // Hands-free loop: automatically restart listening after AI finishes!
-      this.startListening();
+
+      // 400ms Verzögerung vor dem Neustart des Mikrofons
+      if (this.restartTimeout) {
+        clearTimeout(this.restartTimeout);
+      }
+      this.restartTimeout = setTimeout(() => {
+        if (!this.isSpeaking && this.autoListenEnabled) {
+          this.startListening();
+        }
+      }, 400);
     };
 
     utterance.onerror = (e) => {
@@ -327,8 +322,15 @@ class SpeechService {
       this.currentUtterance = null;
       console.warn('Speech synthesis error:', e);
       options.onError?.(e);
-      // Resume listening
-      this.startListening();
+
+      if (this.restartTimeout) {
+        clearTimeout(this.restartTimeout);
+      }
+      this.restartTimeout = setTimeout(() => {
+        if (!this.isSpeaking && this.autoListenEnabled) {
+          this.startListening();
+        }
+      }, 400);
     };
 
     window.speechSynthesis.speak(utterance);

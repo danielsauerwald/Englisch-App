@@ -50,16 +50,35 @@ export interface EvaluationResponsePayload {
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    console.warn('Warning: GEMINI_API_KEY environment variable is not set');
+    throw new Error('GEMINI_API_KEY ist in der Server-Umgebung nicht gesetzt. Bitte API-Key konfigurieren.');
   }
   return new GoogleGenAI({
-    apiKey: apiKey || '',
+    apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
   });
+}
+
+async function executeWithRetry<T>(fn: () => Promise<T>, maxRetries = 2, delayMs = 1200): Promise<T> {
+  let lastError: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const msg = err?.message || String(err);
+      const isTransient = msg.includes('503') || msg.includes('high demand') || msg.includes('UNAVAILABLE') || msg.includes('RESOURCE_EXHAUSTED');
+      if (isTransient && attempt < maxRetries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
 export async function processChat(payload: ChatRequestPayload): Promise<ChatResponsePayload> {
@@ -93,18 +112,18 @@ export async function processChat(payload: ChatRequestPayload): Promise<ChatResp
 
   let correctionInstruction = '';
   if (correctionMode === 'free') {
-    correctionInstruction = 'Do NOT correct errors during the conversation. Focus entirely on content and flow like an engaging friend.';
+    correctionInstruction = 'Do NOT correct errors during the conversation. Focus entirely on content and flow like an engaging conversational partner.';
   } else if (correctionMode === 'gentle') {
-    correctionInstruction = 'GENTLE RECAST: If the user made a grammar or vocabulary error, naturally and unobtrusively mirror the correct phrase in your English reply, without explicitly saying "that was wrong".';
+    correctionInstruction = 'GENTLE RECAST: If the user made a grammar or vocabulary error, naturally mirror the correct phrase in your English reply, without explicitly saying "that was wrong".';
   } else {
-    correctionInstruction = 'STRICT TEACHER: If the user made a noticeable grammar/vocabulary mistake, begin your response with a 1-sentence friendly polite correction (e.g. "Quick tip: Instead of \'...\', we usually say \'...\' because..."), then smoothly continue the conversation.';
+    correctionInstruction = 'STRICT TEACHER: If the user made a noticeable grammar/vocabulary mistake, start your response with a 1-sentence friendly polite correction (e.g. "Quick tip: Instead of \'...\', we say \'...\'"), then smoothly continue the conversation.';
   }
 
   let translationInstruction = '';
   if (translationMode === 'with_translation') {
-    translationInstruction = 'Always provide both the English spoken sentence and a precise, natural German translation.';
+    translationInstruction = 'Always provide both the English spoken sentence and a natural, accurate German translation.';
   } else if (translationMode === 'on_demand') {
-    translationInstruction = 'Only provide a German translation if the user specifically asked for one (e.g. "What does that mean in German?", "Übersetze das"). Otherwise, provide German only when relevant.';
+    translationInstruction = 'Only provide a German translation if the user specifically asked for one (e.g. "What does that mean in German?", "Übersetze das").';
   } else {
     translationInstruction = 'Pure 100% English conversation. Only provide German translation if strictly asked via command.';
   }
@@ -123,19 +142,20 @@ TARGET LEARNER PROFILE:
 ${timeWarning}
 
 CAR-MODE VOICE CONSTRAINTS:
-1. BREVITY: Keep your spoken English response to 2 to 4 sentences maximum (approx 30-50 words). Long monologues are dangerous and exhausting while driving.
-2. ENGAGEMENT: Always end with a clear, open-ended question or engaging prompt that is easy for the driver to answer out loud.
-3. VOICE COMMAND RECOGNITION:
+1. BREVITY & PACING: Keep your spoken English response to 2 to 4 punchy, natural sentences (approx 30-50 words). Never produce a monologue.
+2. DYNAMIC & ENGAGING: Always respond directly to what the user just said in the conversation history! Never repeat generic canned sentences.
+3. CONVERSATIONAL HOOK: Always end with an engaging open-ended question or thought-provoking prompt suited to the topic and learner level.
+4. VOICE COMMAND RECOGNITION:
 If the user's latest statement contains an operational command (in German or English), prioritize it:
 - Slower / Sprich langsamer -> acknowledge warmly and speak slower.
 - Faster / Sprich schneller -> acknowledge and speak faster.
 - Repeat / Wiederholen / Noch einmal -> repeat your previous point concisely.
 - Translate / Übersetze -> provide the German translation of the previous statement.
-- New topic / Neues Thema -> acknowledge and kick off an exciting new conversation topic.
+- New topic / Neues Thema -> acknowledge and introduce an exciting new topic.
 
 You must respond in valid JSON format matching this schema:
 {
-  "englishText": "The conversational English sentence(s) to be spoken aloud via browser speech synthesis.",
+  "englishText": "The conversational English sentence(s) to be spoken aloud.",
   "germanTranslation": "Natural German translation (if requested or applicable, else empty string)",
   "correctionFeedback": "Short tip or gentle correction if strict mode applies, else empty string",
   "detectedCommand": "slower | faster | repeat | translate | new_topic | null",
@@ -143,34 +163,54 @@ You must respond in valid JSON format matching this schema:
   "suggestedFollowUp": "Brief 1-sentence question or prompt"
 }`;
 
+  // Build conversational context ensuring alternating turns starting with user
   const promptContents: any[] = [];
 
-  // Build conversational context
-  if (messages && messages.length > 0) {
-    for (const msg of messages) {
-      promptContents.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
-      });
-    }
-  } else {
-    // Initial opening prompt
+  if (!messages || messages.length === 0) {
     promptContents.push({
       role: 'user',
       parts: [
         {
           text: isInitial
             ? `Hello! I just started my car trip. Start our conversation on the topic "${topicDescriptions[topicMode]}" at CEFR ${level} level. Greet me warmly and ask an opening question to get me talking!`
-            : 'Let\'s start our English conversation for this drive!',
+            : `Let's start our English conversation for this drive on the topic "${topicDescriptions[topicMode]}".`,
         },
       ],
     });
+  } else {
+    let hasUserStarted = false;
+    for (const msg of messages) {
+      const role = msg.role === 'assistant' ? 'model' : 'user';
+      if (!hasUserStarted && role === 'model') {
+        promptContents.push({
+          role: 'user',
+          parts: [
+            {
+              text: `Let's practice English on the topic "${topicDescriptions[topicMode]}" at CEFR ${level} level.`,
+            },
+          ],
+        });
+        hasUserStarted = true;
+      } else if (role === 'user') {
+        hasUserStarted = true;
+      }
+
+      // Merge consecutive identical roles to avoid API rejection
+      const prev = promptContents[promptContents.length - 1];
+      if (prev && prev.role === role) {
+        prev.parts[0].text += `\n${msg.content}`;
+      } else {
+        promptContents.push({
+          role,
+          parts: [{ text: msg.content }],
+        });
+      }
+    }
   }
 
   const useGoogleSearch = topicMode === 'news';
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
+  const generateParams = {
     contents: promptContents,
     config: {
       systemInstruction,
@@ -194,25 +234,29 @@ You must respond in valid JSON format matching this schema:
         required: ['englishText'],
       },
     },
-  });
+  };
 
-  const rawText = response.text || '{}';
-  try {
-    const parsed = JSON.parse(rawText);
-    return {
-      englishText: parsed.englishText || 'Hello! How are you doing today?',
-      germanTranslation: parsed.germanTranslation || undefined,
-      correctionFeedback: parsed.correctionFeedback || undefined,
-      detectedCommand: parsed.detectedCommand === 'none' ? undefined : parsed.detectedCommand,
-      commandAcknowledgement: parsed.commandAcknowledgement || undefined,
-      suggestedFollowUp: parsed.suggestedFollowUp || undefined,
-    };
-  } catch (err) {
-    console.error('Error parsing chat JSON:', err, rawText);
-    return {
-      englishText: rawText.replace(/[{}[\]"]/g, '').trim() || 'Hello! Let\'s continue our conversation.',
-    };
+  const response = await executeWithRetry(() =>
+    ai.models.generateContent({
+      ...generateParams,
+      model: 'gemini-3.8-flash',
+    })
+  );
+
+  const rawText = response.text;
+  if (!rawText) {
+    throw new Error('Gemini API hat eine leere Antwort zurückgegeben.');
   }
+
+  const parsed = JSON.parse(rawText);
+  return {
+    englishText: parsed.englishText || '',
+    germanTranslation: parsed.germanTranslation || undefined,
+    correctionFeedback: parsed.correctionFeedback || undefined,
+    detectedCommand: parsed.detectedCommand === 'none' ? undefined : parsed.detectedCommand,
+    commandAcknowledgement: parsed.commandAcknowledgement || undefined,
+    suggestedFollowUp: parsed.suggestedFollowUp || undefined,
+  };
 }
 
 export async function processEvaluation(payload: EvaluationRequestPayload): Promise<EvaluationResponsePayload> {
@@ -238,8 +282,7 @@ Carefully evaluate the Learner's English:
 6. Corrections List: Identify actual mistakes made by the Learner. If the learner made few or no mistakes, provide 2-3 natural phrasing upgrades ("Better way / Native phrasing"). For each, provide what they said, the improved/correct sentence, and a concise German explanation.
 7. Vocabulary Harvest: 3 to 5 high-value words or idioms used in or directly relevant to the conversation, with their German translation, CEFR level tag, and an illustrative example sentence.`;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
+  const evalParams = {
     contents: [
       {
         role: 'user',
@@ -298,40 +341,18 @@ Carefully evaluate the Learner's English:
         ],
       },
     },
-  });
+  };
 
-  const rawText = response.text || '{}';
-  try {
-    return JSON.parse(rawText) as EvaluationResponsePayload;
-  } catch (err) {
-    console.error('Failed to parse evaluation response:', err, rawText);
-    return {
-      grammarScore: 78,
-      vocabScore: 75,
-      fluencyScore: 82,
-      overallScore: 78,
-      feedbackSummary: 'Gute Fahrt und toller Einsatz! Du hast dich flüssig und verständlich auf Englisch ausgedrückt. Achte in Zukunft noch mehr auf Präpositionen und abwechslungsreiche Satzanfänge.',
-      corrections: [
-        {
-          userSaid: 'I go by car everyday.',
-          betterWay: 'I drive to work every day / I commute by car every day.',
-          explanationDe: '\'Commute by car\' klingt natürlicher für das tägliche Pendeln.',
-        },
-      ],
-      vocabularyHarvest: [
-        {
-          english: 'commute',
-          german: 'pendeln / Arbeitsweg',
-          exampleSentence: 'My daily commute takes about thirty minutes.',
-          cefrLevel: 'B1',
-        },
-        {
-          english: 'on the go',
-          german: 'unterwegs sein',
-          exampleSentence: 'I like listening to podcasts while on the go.',
-          cefrLevel: 'B2',
-        },
-      ],
-    };
+  const response = await executeWithRetry(() =>
+    ai.models.generateContent({
+      ...evalParams,
+      model: 'gemini-3.8-flash',
+    })
+  );
+
+  const rawText = response.text;
+  if (!rawText) {
+    throw new Error('Gemini API hat keine Auswertung geliefert.');
   }
+  return JSON.parse(rawText) as EvaluationResponsePayload;
 }

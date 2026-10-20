@@ -3,7 +3,6 @@ import {
   Mic,
   MicOff,
   Volume2,
-  VolumeX,
   Gauge,
   RotateCcw,
   Languages,
@@ -12,8 +11,8 @@ import {
   Clock,
   Sparkles,
   Radio,
-  Eye,
-  ChevronDown,
+  AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 import {
   UserSettings,
@@ -41,6 +40,8 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   const [isUserPaused, setIsUserPaused] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [lastUserSpeech, setLastUserSpeech] = useState('');
+  const [apiError, setApiError] = useState<string | null>(null);
+
   const [lastAiResponse, setLastAiResponse] = useState<{
     english: string;
     german?: string;
@@ -75,10 +76,13 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   // Wake Lock Setup
   useEffect(() => {
     wakeLockService.acquire();
+    speechService.setAutoListen(true);
+
     return () => {
       wakeLockService.release();
       speechService.cancelSpeech();
-      speechService.stopListening();
+      speechService.abortListening();
+      speechService.setAutoListen(false);
     };
   }, []);
 
@@ -125,25 +129,17 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         },
         onEnd: () => {
           setIsAiSpeaking(false);
-          // If translation mode is 'with_translation', should we speak the German sentence or just display it?
-          // We display it prominently. Speaking both continuously in the car can feel cluttered, but if desired or on demand we can speak it!
           setStatusMessage('Höre zu...');
-          if (!isUserPaused) {
-            speechService.startListening();
-          }
           onComplete?.();
         },
         onError: () => {
           setIsAiSpeaking(false);
           setStatusMessage('Höre zu...');
-          if (!isUserPaused) {
-            speechService.startListening();
-          }
           onComplete?.();
         },
       });
     },
-    [settings.voiceURI, isUserPaused]
+    [settings.voiceURI]
   );
 
   // Send message to backend Gemini API
@@ -156,9 +152,10 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
       if (isAiThinking) return;
 
       setIsAiThinking(true);
-      speechService.playThinkingChime();
-      setStatusMessage('KI denkt nach...');
-      speechService.stopListening();
+      setApiError(null);
+      setStatusMessage('KI überlegt...');
+      // Ensure microphone is completely shut off before processing
+      speechService.abortListening();
 
       let currentHistory = messagesRef.current;
       if (userText) {
@@ -192,11 +189,23 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         });
 
         if (!response.ok) {
-          throw new Error(`Chat API error: ${response.status}`);
+          const errorPayload = await response.json().catch(() => null);
+          const errorMsg =
+            errorPayload?.error ||
+            `Server-Fehler ${response.status}: ${response.statusText || 'Verbindung fehlgeschlagen'}`;
+          throw new Error(errorMsg);
         }
 
         const data = await response.json();
-        const assistantText = data.englishText || 'I see. Please tell me more about your thoughts!';
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        const assistantText = data.englishText;
+        if (!assistantText) {
+          throw new Error('Gemini API hat keinen englischen Text geliefert.');
+        }
+
         const germanText = data.germanTranslation || undefined;
 
         const assistantMsg: ConversationMessage = {
@@ -211,16 +220,18 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         setMessages((prev) => [...prev, assistantMsg]);
         setLastAiResponse({ english: assistantText, german: germanText });
         setIsAiThinking(false);
+        setApiError(null);
 
-        // Speak the English answer
+        // Speak the genuine Gemini response cleanly
         speakAiText(assistantText, germanText);
-      } catch (err) {
-        console.error('Error contacting Gemini backend:', err);
+      } catch (err: any) {
+        console.error('API Error in sendToGemini:', err);
         setIsAiThinking(false);
-        const fallbackText =
-          'I am listening. That is an interesting point. Could you tell me more?';
-        setLastAiResponse({ english: fallbackText });
-        speakAiText(fallbackText);
+        // Do NOT speak any mock or fallback sentence!
+        speechService.cancelSpeech();
+        speechService.abortListening();
+        setApiError(err.message || String(err));
+        setStatusMessage('Fehler bei der KI-Kommunikation');
       }
     },
     [isAiThinking, secondsRemaining, settings, speakAiText]
@@ -229,34 +240,32 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   // Execute Voice Command
   const handleVoiceCommand = useCallback(
     (command: VoiceCommandType) => {
-      speechService.playCommandChime();
-
       if (command === 'slower') {
         const newSpeed = Math.max(0.6, Number((currentSpeedRef.current - 0.15).toFixed(2)));
         setCurrentSpeed(newSpeed);
         currentSpeedRef.current = newSpeed;
-        setCommandFeedback(`Sprechtempo reduziert (${newSpeed}x)`);
-        speechService.speak('Sure, speaking a bit slower now.', {
+        setCommandFeedback(`Sprechtempo: ${newSpeed}x`);
+        speechService.speak('Speaking slower now.', {
           voiceURI: settings.voiceURI,
           rate: newSpeed,
         });
-        setTimeout(() => setCommandFeedback(null), 3500);
+        setTimeout(() => setCommandFeedback(null), 3000);
       } else if (command === 'faster') {
         const newSpeed = Math.min(1.4, Number((currentSpeedRef.current + 0.15).toFixed(2)));
         setCurrentSpeed(newSpeed);
         currentSpeedRef.current = newSpeed;
-        setCommandFeedback(`Sprechtempo erhöht (${newSpeed}x)`);
-        speechService.speak('Got it, speeding up a bit!', {
+        setCommandFeedback(`Sprechtempo: ${newSpeed}x`);
+        speechService.speak('Speeding up.', {
           voiceURI: settings.voiceURI,
           rate: newSpeed,
         });
-        setTimeout(() => setCommandFeedback(null), 3500);
+        setTimeout(() => setCommandFeedback(null), 3000);
       } else if (command === 'repeat') {
-        setCommandFeedback('Wiederhole letzte Aussage');
+        setCommandFeedback('Wiederhole Aussage');
         if (lastAiResponse.english) {
           speakAiText(lastAiResponse.english, lastAiResponse.german);
         }
-        setTimeout(() => setCommandFeedback(null), 3500);
+        setTimeout(() => setCommandFeedback(null), 3000);
       } else if (command === 'translate') {
         setCommandFeedback('Deutsche Übersetzung');
         if (lastAiResponse.german) {
@@ -265,14 +274,13 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
             rate: 1.0,
           });
         } else {
-          // If no pre-calculated German translation, request translation directly
           sendToGemini('Please translate your last statement into German.');
         }
-        setTimeout(() => setCommandFeedback(null), 4000);
+        setTimeout(() => setCommandFeedback(null), 3500);
       } else if (command === 'new_topic') {
         setCommandFeedback('Themenwechsel...');
         sendToGemini('Let\'s switch to a completely new, exciting topic!', 'random');
-        setTimeout(() => setCommandFeedback(null), 3500);
+        setTimeout(() => setCommandFeedback(null), 3000);
       } else if (command === 'finish') {
         setCommandFeedback('Fahrt wird beendet...');
         handleWrapUpAndFinish();
@@ -295,7 +303,7 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         return;
       }
 
-      // Normal conversation turn: forward to Gemini
+      // Normal conversation turn: forward real input to Gemini with chat history
       sendToGemini(transcript);
     },
     [handleVoiceCommand, sendToGemini]
@@ -313,14 +321,14 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         }
       },
       onError: (err) => {
-        console.warn('Recognition error:', err);
+        console.warn('Recognition warning:', err);
       },
     });
 
     // Start with warm AI opening greeting
     const timer = setTimeout(() => {
       sendToGemini(undefined, undefined, true);
-    }, 600);
+    }, 400);
 
     return () => {
       clearTimeout(timer);
@@ -330,7 +338,8 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   // Wrap up & finish
   const handleWrapUpAndFinish = () => {
     speechService.cancelSpeech();
-    speechService.stopListening();
+    speechService.abortListening();
+    speechService.setAutoListen(false);
     const elapsedMinutes = Math.max(
       1,
       Math.round((Date.now() - sessionStartTimeRef.current) / 60000)
@@ -342,33 +351,22 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
   const handleTogglePause = () => {
     if (isUserPaused) {
       setIsUserPaused(false);
+      speechService.setAutoListen(true);
       setStatusMessage('Höre zu...');
       speechService.startListening();
     } else {
       setIsUserPaused(true);
+      speechService.setAutoListen(false);
       setStatusMessage('Mikrofon pausiert');
       speechService.cancelSpeech();
-      speechService.stopListening();
+      speechService.abortListening();
     }
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between p-4 select-none overflow-hidden relative">
-      {/* Background ambient dashboard glow */}
-      <div
-        className={`absolute inset-0 pointer-events-none transition-opacity duration-1000 ${
-          isListening
-            ? 'bg-radial-[at_50%_40%] from-cyan-950/40 via-transparent to-transparent'
-            : isAiSpeaking
-            ? 'bg-radial-[at_50%_40%] from-purple-950/40 via-transparent to-transparent'
-            : isAiThinking
-            ? 'bg-radial-[at_50%_40%] from-amber-950/40 via-transparent to-transparent'
-            : 'bg-transparent'
-        }`}
-      />
-
       {/* 1. TOP CAR DASHBOARD BAR (Extra high contrast) */}
-      <div className="z-20 flex items-center justify-between bg-slate-900/90 border border-slate-800 rounded-3xl p-3 sm:p-4 shadow-xl">
+      <div className="z-20 flex items-center justify-between bg-slate-900/95 border border-slate-800 rounded-3xl p-3 sm:p-4 shadow-xl">
         {/* Left: Level & Topic Badges */}
         <div className="flex items-center gap-2">
           <span className="px-3 py-1.5 rounded-xl bg-cyan-500 text-slate-950 font-black text-sm tracking-wide">
@@ -408,7 +406,7 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         <div className="flex items-center gap-2">
           <div
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-bold"
-            title="Screen Wake Lock ist aktiv – Display bleibt an"
+            title="Screen Wake Lock ist aktiv"
           >
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             <span className="hidden sm:inline">Display Aktiv</span>
@@ -432,19 +430,18 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         </div>
       )}
 
-      {/* 2. CENTER STAGE: AUDIO LOOP & SUBTITLES */}
+      {/* 2. CENTER STAGE: AUDIO LOOP & SUBTITLES / ERROR DISPLAY */}
       <div className="z-10 flex-1 flex flex-col items-center justify-center py-4 px-2 max-w-2xl mx-auto w-full text-center">
-        {/* Pulsating Visual Soundwave / Radar Ring Indicator */}
+        {/* Pulsating Visual Indicator */}
         <div className="relative mb-6 flex items-center justify-center">
-          {/* Outer glowing animated pulse rings */}
-          {isListening && !isUserPaused && (
+          {isListening && !isUserPaused && !apiError && (
             <>
               <div className="absolute w-44 h-44 rounded-full bg-cyan-500/20 animate-ping opacity-75" />
               <div className="absolute w-56 h-56 rounded-full bg-cyan-400/10 animate-pulse" />
             </>
           )}
 
-          {isAiSpeaking && (
+          {isAiSpeaking && !apiError && (
             <>
               <div className="absolute w-44 h-44 rounded-full bg-purple-500/20 animate-ping opacity-60" />
               <div className="absolute w-56 h-56 rounded-full bg-indigo-500/10 animate-pulse" />
@@ -454,7 +451,9 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
           {/* Central status orb */}
           <div
             className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-2xl transition duration-500 border-4 ${
-              isUserPaused
+              apiError
+                ? 'bg-rose-950/80 border-rose-500 text-rose-300 shadow-rose-500/40'
+                : isUserPaused
                 ? 'bg-slate-900 border-amber-500/50 text-amber-400 shadow-amber-500/20'
                 : isAiSpeaking
                 ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 border-purple-300 text-white shadow-purple-500/40 scale-105'
@@ -465,7 +464,12 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
                 : 'bg-slate-900 border-slate-700 text-slate-400'
             }`}
           >
-            {isUserPaused ? (
+            {apiError ? (
+              <>
+                <AlertTriangle className="w-10 h-10" />
+                <span className="text-[10px] font-black uppercase tracking-wider mt-1">Fehler</span>
+              </>
+            ) : isUserPaused ? (
               <>
                 <MicOff className="w-10 h-10" />
                 <span className="text-[10px] font-black uppercase tracking-wider mt-1">Pausiert</span>
@@ -498,7 +502,9 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
         <div className="mb-4">
           <span
             className={`inline-block text-xs uppercase font-extrabold tracking-widest px-3 py-1 rounded-full ${
-              isUserPaused
+              apiError
+                ? 'bg-rose-500/20 text-rose-300 border border-rose-500/50'
+                : isUserPaused
                 ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
                 : isAiSpeaking
                 ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
@@ -513,31 +519,61 @@ export const CarModeScreen: React.FC<CarModeScreenProps> = ({
           </span>
         </div>
 
-        {/* Large Subtitle Card (Read out of eye corner) */}
-        <div className="w-full bg-slate-900/90 border border-slate-800/80 rounded-3xl p-5 sm:p-6 shadow-2xl backdrop-blur-md">
-          {/* Spoken English Utterance (Big, crisp, high contrast) */}
-          <div className="text-xl sm:text-2xl font-extrabold text-white leading-relaxed tracking-tight">
-            {lastAiResponse.english}
+        {/* RED ERROR BOX (When an API error occurs, show exact technical error) */}
+        {apiError ? (
+          <div className="w-full bg-rose-950/80 border-2 border-rose-500 rounded-3xl p-5 sm:p-6 shadow-2xl backdrop-blur-md text-left space-y-3 animate-shake">
+            <div className="flex items-center gap-2.5 text-rose-400">
+              <AlertTriangle className="w-6 h-6 shrink-0" />
+              <h3 className="font-extrabold text-base sm:text-lg text-white">
+                Gemini API-Fehler aufgetreten
+              </h3>
+            </div>
+            <p className="text-xs sm:text-sm text-rose-200 font-mono bg-black/50 p-3 rounded-xl border border-rose-900 break-words">
+              {apiError}
+            </p>
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => sendToGemini(lastUserSpeech || undefined)}
+                className="flex-1 py-3 px-4 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>Erneut versuchen</span>
+              </button>
+              <button
+                onClick={onExitWithoutSave}
+                className="py-3 px-4 rounded-xl bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 font-bold text-xs transition"
+              >
+                Abbrechen
+              </button>
+            </div>
           </div>
-
-          {/* German Translation (if enabled) */}
-          {lastAiResponse.german && settings.translationMode !== 'english_only' && (
-            <div className="mt-3 pt-3 border-t border-slate-800 text-sm sm:text-base font-medium text-cyan-300/90 flex items-start justify-center gap-2">
-              <Languages className="w-4 h-4 shrink-0 text-cyan-400 mt-0.5" />
-              <span>{lastAiResponse.german}</span>
+        ) : (
+          /* Normal Subtitle Card */
+          <div className="w-full bg-slate-900/90 border border-slate-800/80 rounded-3xl p-5 sm:p-6 shadow-2xl backdrop-blur-md">
+            {/* Spoken English Utterance */}
+            <div className="text-xl sm:text-2xl font-extrabold text-white leading-relaxed tracking-tight">
+              {lastAiResponse.english}
             </div>
-          )}
 
-          {/* Live User Speech Bubble / Interim */}
-          {(interimTranscript || lastUserSpeech) && (
-            <div className="mt-4 pt-3 border-t border-slate-800/60 text-xs sm:text-sm text-slate-400 flex items-center justify-center gap-2">
-              <span className="text-cyan-400 font-bold">Du:</span>
-              <span className="italic text-slate-200">
-                "{interimTranscript || lastUserSpeech}"
-              </span>
-            </div>
-          )}
-        </div>
+            {/* German Translation (if enabled) */}
+            {lastAiResponse.german && settings.translationMode !== 'english_only' && (
+              <div className="mt-3 pt-3 border-t border-slate-800 text-sm sm:text-base font-medium text-cyan-300/90 flex items-start justify-center gap-2">
+                <Languages className="w-4 h-4 shrink-0 text-cyan-400 mt-0.5" />
+                <span>{lastAiResponse.german}</span>
+              </div>
+            )}
+
+            {/* Live User Speech Bubble / Interim */}
+            {(interimTranscript || lastUserSpeech) && (
+              <div className="mt-4 pt-3 border-t border-slate-800/60 text-xs sm:text-sm text-slate-400 flex items-center justify-center gap-2">
+                <span className="text-cyan-400 font-bold">Du:</span>
+                <span className="italic text-slate-200">
+                  "{interimTranscript || lastUserSpeech}"
+                </span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Spoken Command Reminders Pill */}
         <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5 text-[11px] text-slate-400">

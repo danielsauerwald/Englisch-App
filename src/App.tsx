@@ -30,6 +30,7 @@ export default function App() {
   // Evaluation state
   const [evaluationReport, setEvaluationReport] = useState<SessionReport | null>(null);
   const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
 
   // App Update Hook
   const {
@@ -79,6 +80,7 @@ export default function App() {
         : 'Zufälliges Gesprächsthema';
 
     try {
+      setEvalError(null);
       const response = await fetch('/api/evaluate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -91,10 +93,14 @@ export default function App() {
       });
 
       if (!response.ok) {
-        throw new Error(`Evaluation API returned status ${response.status}`);
+        const errorJson = await response.json().catch(() => null);
+        throw new Error(errorJson?.error || `Evaluation API Fehler ${response.status}`);
       }
 
       const evalData = await response.json();
+      if (evalData.error) {
+        throw new Error(evalData.error);
+      }
 
       const newReport: SessionReport = {
         id: `session-${Date.now()}`,
@@ -118,56 +124,9 @@ export default function App() {
       const updatedStats = storageService.addSessionReport(newReport);
       setStats(updatedStats);
       setEvaluationReport(newReport);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to evaluate session with Gemini:', err);
-      // Fallback sensible evaluation report
-      const fallbackReport: SessionReport = {
-        id: `session-${Date.now()}`,
-        date: new Date().toISOString(),
-        durationMinutes,
-        level: settings.level,
-        topic: topicLabel,
-        grammarScore: 78,
-        vocabScore: 76,
-        fluencyScore: 82,
-        overallScore: 79,
-        feedbackSummary:
-          'Sehr gute Fahrt! Dein Redefluss war durchgängig verständlich. Konzentriere dich bei der nächsten Autofahrt noch stärker auf abwechslungsreiche Verben und idiomatische Wendungen.',
-        corrections: [
-          {
-            id: `corr-${Date.now()}`,
-            userSaid: 'I was driving to work today.',
-            betterWay: 'I commuted to work by car today.',
-            explanationDe: 'Für den Weg zur Arbeit ist "commute" das passendste englische Vokabular.',
-            date: new Date().toISOString(),
-          },
-        ],
-        vocabularyHarvest: [
-          {
-            id: `vocab-${Date.now()}-1`,
-            english: 'navigate',
-            german: 'navigieren, steuern',
-            exampleSentence: 'I had to navigate heavy traffic on the highway.',
-            cefrLevel: 'B1',
-            savedAt: new Date().toISOString(),
-            mastered: false,
-          },
-          {
-            id: `vocab-${Date.now()}-2`,
-            english: 'in retrospect',
-            german: 'rückblickend betrachtet',
-            exampleSentence: 'In retrospect, taking the alternate route was a wise choice.',
-            cefrLevel: 'B2',
-            savedAt: new Date().toISOString(),
-            mastered: false,
-          },
-        ],
-        messagesCount: messages.length,
-      };
-
-      const updatedStats = storageService.addSessionReport(fallbackReport);
-      setStats(updatedStats);
-      setEvaluationReport(fallbackReport);
+      setEvalError(err.message || String(err));
     } finally {
       setIsEvaluating(false);
     }
@@ -215,16 +174,19 @@ export default function App() {
       </main>
 
       {/* Post-Drive Evaluation Modal */}
-      {(evaluationReport || isEvaluating) && (
+      {(evaluationReport || isEvaluating || evalError) && (
         <EvaluationModal
           report={evaluationReport}
           isLoading={isEvaluating}
+          errorMessage={evalError}
           onGoToDashboard={() => {
             setEvaluationReport(null);
+            setEvalError(null);
             setCurrentTab('dashboard');
           }}
           onNewDrive={() => {
             setEvaluationReport(null);
+            setEvalError(null);
             setCurrentTab('setup');
           }}
         />
